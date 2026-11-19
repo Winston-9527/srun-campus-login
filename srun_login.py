@@ -18,6 +18,10 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 
+DEFAULT_PORTAL_URL = "https://net.szu.edu.cn"
+DEFAULT_AC_ID = "12"
+
+
 def request_jsonp(opener, portal_url, path, params):
     params = dict(params, callback="jsonp", _=str(int(time.time() * 1000)))
     url = portal_url + path + "?" + urlencode(params)
@@ -113,17 +117,15 @@ def parse_args(argv):
     command = parser.add_mutually_exclusive_group()
     command.add_argument("--status", action="store_true", help="查询校园网认证状态")
     command.add_argument("--logout", action="store_true", help="退出当前校园网会话")
-    parser.add_argument("--url", default=os.environ.get("SRUN_URL"),
-                        help="校园网 HTTPS 网关地址，默认读取 SRUN_URL")
-    parser.add_argument("--ac-id", default=os.environ.get("SRUN_AC_ID"),
-                        help="网关的 ac_id，默认读取 SRUN_AC_ID")
+    parser.add_argument("--url", default=os.environ.get("SRUN_URL") or DEFAULT_PORTAL_URL,
+                        help=f"校园网 HTTPS 网关地址，优先读取 SRUN_URL，默认 {DEFAULT_PORTAL_URL}")
+    parser.add_argument("--ac-id", default=os.environ.get("SRUN_AC_ID") or DEFAULT_AC_ID,
+                        help=f"认证入口编号，优先读取 SRUN_AC_ID，默认 {DEFAULT_AC_ID}")
     tls = parser.add_mutually_exclusive_group()
     tls.add_argument("--ca-file", help="额外信任的 CA 证书文件（PEM 格式）")
     tls.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
     args = parser.parse_args(argv)
 
-    if not args.url:
-        parser.error("请设置 --url 或 SRUN_URL")
     try:
         portal = urlsplit(args.url)
         if portal.port == 0:
