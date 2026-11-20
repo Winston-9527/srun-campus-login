@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconnect to the SRun campus network if offline
+After=network.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+LoadCredentialEncrypted=srun_cred:/etc/srun-login/srun.cred
+ExecStart=/usr/bin/python3 /opt/srun-login/srun_login.py --reconnect
+TimeoutStartSec=45s

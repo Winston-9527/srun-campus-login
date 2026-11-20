@@ -2,6 +2,7 @@
 """Log in to an SRun campus network from the command line."""
 import argparse
 import base64
+import errno
 import getpass
 import hashlib
 import hmac
@@ -10,16 +11,23 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 
 
 DEFAULT_PORTAL_URL = "https://net.szu.edu.cn"
 DEFAULT_AC_ID = "12"
+MAINTENANCE_LOCK_ADDRESS = b"\0srun-campus-login"
+
+
+class RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def request_jsonp(opener, portal_url, path, params):
@@ -92,7 +100,20 @@ def b64(s):
     return base64.b64encode(s.encode("latin-1")).decode().translate(str.maketrans(STD, CUS))
 
 
-def credentials():
+def read_credentials(path):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2 or not lines[0].strip() or not lines[1]:
+        raise ValueError(f"{path.name} 需要在前两行分别填写账号和密码")
+    return lines[0].strip(), lines[1]
+
+
+def credentials(reconnect=False):
+    if reconnect:
+        directory = os.environ.get("CREDENTIALS_DIRECTORY")
+        if not directory:
+            raise ValueError("自动重连需要通过 systemd 提供 srun_cred 凭据")
+        return read_credentials(Path(directory) / "srun_cred")
+
     username = os.environ.get("SRUN_USER")
     password = os.environ.get("SRUN_PASS")
     if username and password:
@@ -100,10 +121,7 @@ def credentials():
 
     credential_file = Path.home() / ".srun_cred"
     if credential_file.exists():
-        lines = credential_file.read_text(encoding="utf-8").splitlines()
-        if len(lines) < 2 or not lines[0].strip() or not lines[1]:
-            raise ValueError("~/.srun_cred 需要在前两行分别填写账号和密码")
-        return lines[0].strip(), lines[1]
+        return read_credentials(credential_file)
 
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
@@ -117,6 +135,7 @@ def parse_args(argv):
     command = parser.add_mutually_exclusive_group()
     command.add_argument("--status", action="store_true", help="查询校园网认证状态")
     command.add_argument("--logout", action="store_true", help="退出当前校园网会话")
+    command.add_argument("--reconnect", action="store_true", help="使用 systemd 凭据检查并尝试重连一次")
     parser.add_argument("--url", default=os.environ.get("SRUN_URL") or DEFAULT_PORTAL_URL,
                         help=f"校园网 HTTPS 网关地址，优先读取 SRUN_URL，默认 {DEFAULT_PORTAL_URL}")
     parser.add_argument("--ac-id", default=os.environ.get("SRUN_AC_ID") or DEFAULT_AC_ID,
@@ -125,6 +144,8 @@ def parse_args(argv):
     tls.add_argument("--ca-file", help="额外信任的 CA 证书文件（PEM 格式）")
     tls.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
     args = parser.parse_args(argv)
+    if args.reconnect and args.insecure:
+        parser.error("自动重连需要验证网关的 HTTPS 证书")
 
     try:
         portal = urlsplit(args.url)
@@ -149,7 +170,10 @@ def run(args):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-    opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context))
+    handlers = [ProxyHandler({}), HTTPSHandler(context=context)]
+    if args.reconnect:
+        handlers.append(RejectRedirects())
+    opener = build_opener(*handlers)
 
     def get(path, params):
         return request_jsonp(opener, args.url, path, params)
@@ -159,6 +183,11 @@ def run(args):
     if args.status:
         print(json.dumps(info, ensure_ascii=False, indent=2))
         return 0
+    if args.reconnect:
+        if info.get("error") == "ok":
+            return 0
+        if info.get("error") != "not_online_error":
+            raise ValueError("网关未确认当前会话离线，跳过重新认证")
     if not ip:
         raise ValueError("校园网网关未返回客户端 IP")
     if args.logout:
@@ -174,7 +203,7 @@ def run(args):
         print("Already online:", info.get("user_name"), ip)
         return 0
 
-    user, password = credentials()
+    user, password = credentials(args.reconnect)
     token = get("/cgi-bin/get_challenge", {"username": user, "ip": ip}).get("challenge")
     if not isinstance(token, str) or not token:
         raise ValueError("校园网网关未返回登录挑战值")
@@ -202,6 +231,11 @@ def run(args):
         "n": n,
         "type": typ,
     })
+    if args.reconnect:
+        if result.get("error") != "ok":
+            raise ValueError("网关拒绝重新认证，请检查账号、密码和认证入口")
+        print("校园网已重新认证")
+        return 0
     message = result.get("suc_msg") or result.get("error_msg") or result.get("ploy_msg") or ""
     print("result:", result.get("error"), message)
     return 0 if result.get("error") == "ok" else 1
@@ -210,7 +244,19 @@ def run(args):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        return run(args)
+        if args.status or sys.platform != "linux":
+            return run(args)
+
+        # A Linux abstract socket coordinates distinct users without a shared lock file.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as lock:
+            try:
+                lock.bind(MAINTENANCE_LOCK_ADDRESS)
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                print("已有校园网维护任务在运行，本次跳过", file=sys.stderr)
+                return 0 if args.reconnect else 1
+            return run(args)
     except HTTPError as error:
         print(f"校园网网关返回 HTTP {error.code}", file=sys.stderr)
     except (URLError, OSError, ValueError, EOFError) as error:

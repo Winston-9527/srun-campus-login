@@ -1,0 +1,10 @@
+[Unit]
+Description=Check SRun campus network authentication periodically
+
+[Timer]
+OnActiveSec=15s
+OnUnitInactiveSec=30min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
